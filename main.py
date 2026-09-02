@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import threading
+import time
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -423,20 +424,43 @@ class FudoClient:
         url = f"{FUDO_BASE_URL}{endpoint}"
         if raw_query:
             url = f"{url}?{raw_query}"
-        for attempt in range(2):
+
+        max_retries = 2  # reintentos por fallas transitorias (no cuenta el refresh de token)
+        backoff_seconds = [1, 2]
+        auth_attempt = 0
+
+        while True:
             token = self._get_token()
-            resp = requests.get(
-                url,
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=20,
-            )
-            if resp.status_code == 401 and attempt == 0:
+            try:
+                resp = requests.get(
+                    url,
+                    headers={"Authorization": f"Bearer {token}"},
+                    timeout=20,
+                )
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+                if max_retries <= 0:
+                    raise RuntimeError(f"Fudo: fallo de red tras reintentos ({exc})") from exc
+                wait = backoff_seconds[len(backoff_seconds) - max_retries]
+                logging.warning("Fudo: fallo de red, reintentando en %ss | endpoint=%s | %s", wait, endpoint, exc)
+                time.sleep(wait)
+                max_retries -= 1
+                continue
+
+            if resp.status_code == 401 and auth_attempt == 0:
                 with self._lock:
                     self._token = None
+                auth_attempt += 1
                 continue
+
+            if resp.status_code in (429, 500, 502, 503, 504) and max_retries > 0:
+                wait = backoff_seconds[len(backoff_seconds) - max_retries]
+                logging.warning("Fudo: status %s, reintentando en %ss | endpoint=%s", resp.status_code, wait, endpoint)
+                time.sleep(wait)
+                max_retries -= 1
+                continue
+
             resp.raise_for_status()
             return resp.json()
-        raise RuntimeError("Fudo: autenticación fallida tras 2 intentos")
 
 
 # Cache de clientes Fudo ya creados, para no recrear el objeto (y perder el token) en cada mensaje
