@@ -6,6 +6,7 @@ import threading
 import time
 from datetime import datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import requests
 from anthropic import Anthropic
@@ -524,8 +525,35 @@ def _fudo_get(endpoint: str, raw_query: str | None = None) -> dict:
 # Funciones de consulta Fudo (solo lectura)
 # ──────────────────────────────────────────────────────────────
 
+_TIMEZONES = {
+    "chile": "America/Santiago",
+    "argentina": "America/Argentina/Buenos_Aires",
+    "mexico": "America/Mexico_City",
+}
+
+_UTC = ZoneInfo("UTC")
+
+
+def _tz_for_pais(pais: str | None) -> ZoneInfo:
+    """Zona horaria del pais del cliente; Chile por defecto si no se reconoce."""
+    key = (pais or "chile").strip().lower()
+    return ZoneInfo(_TIMEZONES.get(key, "America/Santiago"))
+
+
 def _date_filter(from_date: str, to_date: str) -> str:
-    return f"and(gte.{from_date}T00:00:00Z,lte.{to_date}T23:59:59Z)"
+    """Arma el filtro de fechas de Fudo convirtiendo el dia calendario LOCAL
+    del cliente activo (contextvar) a UTC, que es lo que espera la API."""
+    cliente_info = _current_cliente_info.get()
+    pais = (cliente_info or {}).get("pais") if cliente_info else None
+    tz = _tz_for_pais(pais)
+
+    start_local = datetime.strptime(from_date, "%Y-%m-%d").replace(hour=0, minute=0, second=0, tzinfo=tz)
+    end_local = datetime.strptime(to_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59, tzinfo=tz)
+
+    start_utc = start_local.astimezone(_UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    end_utc = end_local.astimezone(_UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    return f"and(gte.{start_utc},lte.{end_utc})"
 
 def get_sales_report(from_date: str, to_date: str) -> dict:
     return _fudo_get("/sales", f"filter[createdAt]={_date_filter(from_date, to_date)}")
@@ -590,7 +618,7 @@ def get_last_stock_count() -> dict:
     return _fudo_get("/products", "filter[stockControl]=eq.true&page[size]=100&sort=name&fields[product]=name,stock,minStock,lastStockCountAt,stockControl")
 
 def get_expenses(from_date: str, to_date: str, category_id: str | None = None) -> dict:
-    query = (f"filter[createdAt]=and(gte.{from_date}T00:00:00Z,lte.{to_date}T23:59:59Z)"
+    query = (f"filter[createdAt]={_date_filter(from_date, to_date)}"
              "&page[size]=100&sort=-date&include=expenseCategory,provider,payments.paymentMethod")
     if category_id:
         query += f"&filter[expenseCategoryId]=eq.{category_id}"
@@ -600,7 +628,7 @@ def get_expense_categories() -> dict:
     return _fudo_get("/expense-categories", "page[size]=100&sort=name")
 
 def get_payments(from_date: str, to_date: str, canceled: bool = False) -> dict:
-    query = (f"filter[createdAt]=and(gte.{from_date}T00:00:00Z,lte.{to_date}T23:59:59Z)"
+    query = (f"filter[createdAt]={_date_filter(from_date, to_date)}"
              "&filter[canceled]=eq.false&page[size]=100&sort=-id&include=paymentMethod")
     return _fudo_get("/payments", query)
 
@@ -954,7 +982,7 @@ def ask_claude(user_message: str, phone_number: str) -> str:
         pais = (cliente_activo or {}).get("pais") or "chile"
 
         system = SYSTEM_PROMPT.format(
-            today=datetime.now().strftime("%Y-%m-%d"),
+            today=datetime.now(_tz_for_pais(pais)).strftime("%Y-%m-%d"),
             nombre_restaurante=nombre_restaurante,
             nombre_pila=nombre_pila,
             multi_restaurante_ctx=multi_ctx,
